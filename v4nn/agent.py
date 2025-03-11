@@ -1,340 +1,288 @@
-# agent_optimized.py
 import torch
 import random
 import numpy as np
 from collections import deque
-import os
-import torch.nn as nn
-import torch.optim as optim
-import torch.nn.functional as F
+from game import SnakeGameAI, Direction, Point
+from model import Linear_QNet, QTrainer
+from helper import plot
+import math
 
 MAX_MEMORY = 100_000
 BATCH_SIZE = 1000
 LR = 0.001
 
-class SnakeQNet(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size):
-        super().__init__()
-        self.linear1 = nn.Linear(input_size, hidden_size)
-        self.linear2 = nn.Linear(hidden_size, output_size)
+class Agent:
 
-    def forward(self, x):
-        x = F.relu(self.linear1(x))
-        x = self.linear2(x)
-        return x
-
-    def save(self, file_name):
-        model_folder_path = os.path.dirname(file_name)
-        if model_folder_path and not os.path.exists(model_folder_path):
-            os.makedirs(model_folder_path)
-        torch.save(self.state_dict(), file_name)
-
-
-class OptimizedAgent:
-    def __init__(self, verbose=False):
+    def __init__(self):
         self.n_games = 0
-        self.epsilon = 80  # Exploración inicial alta
-        self.min_epsilon = 0  # Mínimo de exploración
-        self.gamma = 0.9  # Factor de descuento
-        self.memory = deque(maxlen=MAX_MEMORY)
-        self.actions = ["UP", "DOWN", "LEFT", "RIGHT"]  # Acciones absolutas disponibles
-        self.action_size = 3  # [recto, derecha, izquierda] - acciones relativas
-        self.verbose = verbose
-        self.snake_length = 3
-        self.max_snake_length = 3
-        self.last_action = None  # Última acción tomada
+        self.epsilon = 0  # randomness
+        self.gamma = 0.9  # discount rate
+        self.memory = deque(maxlen=MAX_MEMORY)  # popleft()
         
-        # Mapeo de caracteres para procesamiento eficiente
-        self.char_to_idx = {
-            'W': 0,   # Pared
-            'S': 0,   # Segmento de cuerpo (igual que pared = peligro)
-            'G': 1,   # Manzana verde
-            'R': 2,   # Manzana roja
-            '0': 3,   # Espacio vacío
-            'H': 4    # Cabeza (no debería aparecer en la visión)
-        }
+        # Ampliamos el número de estados para incluir información de exploración
+        self.model = Linear_QNet(15, 256, 3)
+        self.trainer = QTrainer(self.model, lr=LR, gamma=self.gamma)
         
-        # Crear modelo más eficiente (11 entradas, 256 neuronas ocultas, 3 salidas)
-        self.model = SnakeQNet(11, 256, self.action_size)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=LR)
-        self.criterion = nn.MSELoss()
-    
-    def get_state(self, state_str):
-        """
-        Convierte la visión de la serpiente en un estado compacto similar al original
-        """
-        directions = state_str.split(',')
+        # Mapa para seguimiento de celdas visitadas
+        self.visited_cells = set()
         
-        # Cada dirección representa: [UP, DOWN, LEFT, RIGHT]
-        # Extraer información importante de cada dirección
+        # Información para rastrear la última comida vista
+        self.food_seen = False
+        self.last_food_dir = [0, 0, 0, 0]  # [left, right, up, down]
         
-        # 1. Detectar peligro (pared o cuerpo) en cada dirección
-        danger_straight = '0' not in directions[0][:1] or 'W' in directions[0][:1] or 'S' in directions[0][:1]
-        danger_down = '0' not in directions[1][:1] or 'W' in directions[1][:1] or 'S' in directions[1][:1]
-        danger_left = '0' not in directions[2][:1] or 'W' in directions[2][:1] or 'S' in directions[2][:1] 
-        danger_right = '0' not in directions[3][:1] or 'W' in directions[3][:1] or 'S' in directions[3][:1]
+        # Contador para movimientos sin progreso
+        self.moves_without_progress = 0
+        self.previous_distance = 0
         
-        # 2. Determinar dirección actual basada en la última acción
-        dir_up = self.last_action == "UP" if self.last_action else False
-        dir_down = self.last_action == "DOWN" if self.last_action else True  # Dirección inicial
-        dir_left = self.last_action == "LEFT" if self.last_action else False
-        dir_right = self.last_action == "RIGHT" if self.last_action else False
+        # Para rastrear la última recompensa
+        self.last_score = 0
+
+    def reset(self, game):
+        """Reinicia el estado del agente entre partidas"""
+        self.visited_cells = set()
+        self.food_seen = False
+        self.last_food_dir = [0, 0, 0, 0]
+        self.moves_without_progress = 0
+        self.previous_distance = self._calculate_distance(game.head, game.food)
+        self.last_score = 0
+
+    def _calculate_distance(self, point1, point2):
+        """Calcula la distancia Manhattan entre dos puntos"""
+        return abs(point1.x - point2.x) + abs(point1.y - point2.y)
+
+    def _is_in_vision_range(self, head, food, max_distance=100):
+        """Determina si la comida está en el rango de visión (limitado por distancia)"""
+        # Calcula la distancia Manhattan
+        distance = self._calculate_distance(head, food)
+        return distance <= max_distance
+
+    def get_state(self, game):
+        head = game.snake[0]
+        point_l = Point(head.x - 20, head.y)
+        point_r = Point(head.x + 20, head.y)
+        point_u = Point(head.x, head.y - 20)
+        point_d = Point(head.x, head.y + 20)
         
-        # 3. Detectar comida en la visión
-        food_up = 'G' in directions[0]
-        food_down = 'G' in directions[1]
-        food_left = 'G' in directions[2]
-        food_right = 'G' in directions[3]
+        dir_l = game.direction == Direction.LEFT
+        dir_r = game.direction == Direction.RIGHT
+        dir_u = game.direction == Direction.UP
+        dir_d = game.direction == Direction.DOWN
+
+        # La celda actual está visitada
+        self.visited_cells.add((head.x, head.y))
         
-        # Adaptamos el formato para imitar el enfoque original
-        # Peligros relativos a la dirección actual
-        danger_front = (dir_up and danger_straight) or (dir_down and danger_down) or \
-                       (dir_left and danger_left) or (dir_right and danger_right)
-                       
-        danger_right = (dir_up and danger_right) or (dir_down and danger_left) or \
-                      (dir_left and danger_straight) or (dir_right and danger_down)
-                      
-        danger_left = (dir_up and danger_left) or (dir_down and danger_right) or \
-                     (dir_left and danger_down) or (dir_right and danger_straight)
+        # Verifica si los puntos adyacentes ya han sido visitados
+        left_visited = (point_l.x, point_l.y) in self.visited_cells
+        right_visited = (point_r.x, point_r.y) in self.visited_cells
+        up_visited = (point_u.x, point_u.y) in self.visited_cells
+        down_visited = (point_d.x, point_d.y) in self.visited_cells
+
+        # Detecta si la comida está en línea recta (visión ortogonal)
+        # No verifica bloqueos, solo si está en la misma fila o columna
+        food_left = False
+        food_right = False
+        food_up = False
+        food_down = False
         
-        # Comida relativa a la posición actual
-        food_front = (dir_up and food_up) or (dir_down and food_down) or \
-                    (dir_left and food_left) or (dir_right and food_right)
-                    
-        food_right = (dir_up and food_right) or (dir_down and food_left) or \
-                    (dir_left and food_up) or (dir_right and food_down)
-                    
-        food_left = (dir_up and food_left) or (dir_down and food_right) or \
-                   (dir_left and food_down) or (dir_right and food_up)
+        if self._is_in_vision_range(head, game.food):
+            # Comida a la izquierda en línea recta
+            if game.food.y == head.y and game.food.x < head.x:
+                food_left = True
+                self.food_seen = True
+                self.last_food_dir = [1, 0, 0, 0]
+                
+            # Comida a la derecha en línea recta
+            elif game.food.y == head.y and game.food.x > head.x:
+                food_right = True
+                self.food_seen = True
+                self.last_food_dir = [0, 1, 0, 0]
+                
+            # Comida arriba en línea recta
+            elif game.food.x == head.x and game.food.y < head.y:
+                food_up = True
+                self.food_seen = True
+                self.last_food_dir = [0, 0, 1, 0]
+                
+            # Comida abajo en línea recta
+            elif game.food.x == head.x and game.food.y > head.y:
+                food_down = True
+                self.food_seen = True
+                self.last_food_dir = [0, 0, 0, 1]
         
-        # Estado final compacto (11 valores binarios)
+        # Si la comida fue vista anteriormente, pero ya no está en línea recta
+        elif self.food_seen:
+            food_left, food_right, food_up, food_down = self.last_food_dir
+
         state = [
-            # Peligro en 3 direcciones relativas
-            danger_front,
-            danger_right,
-            danger_left,
+            # Danger straight
+            (dir_r and game.is_collision(point_r)) or 
+            (dir_l and game.is_collision(point_l)) or 
+            (dir_u and game.is_collision(point_u)) or 
+            (dir_d and game.is_collision(point_d)),
+
+            # Danger right
+            (dir_u and game.is_collision(point_r)) or 
+            (dir_d and game.is_collision(point_l)) or 
+            (dir_l and game.is_collision(point_u)) or 
+            (dir_r and game.is_collision(point_d)),
+
+            # Danger left
+            (dir_d and game.is_collision(point_r)) or 
+            (dir_u and game.is_collision(point_l)) or 
+            (dir_r and game.is_collision(point_u)) or 
+            (dir_l and game.is_collision(point_d)),
             
-            # Dirección actual
-            dir_left,
-            dir_right,
-            dir_up,
-            dir_down,
+            # Move direction
+            dir_l,
+            dir_r,
+            dir_u,
+            dir_d,
             
-            # Comida en la visión (relativa)
+            # Food location (visible solo en línea recta)
             food_left,
-            food_right, 
+            food_right,
             food_up,
-            food_down
+            food_down,
+            
+            # Células visitadas (para estimular exploración)
+            left_visited,
+            right_visited,
+            up_visited,
+            down_visited
         ]
-        
+
         return np.array(state, dtype=int)
-    
+
     def remember(self, state, action, reward, next_state, done):
-        """Almacena experiencia en memoria"""
-        # Convertir acción al formato [recto, derecha, izquierda]
-        action_idx = self.get_relative_action_idx(action)
-        action_one_hot = [0] * self.action_size
-        action_one_hot[action_idx] = 1
-        
-        self.memory.append((state, action_one_hot, reward, next_state, done))
-    
-    def get_relative_action_idx(self, action):
-        """Convierte acción absoluta a índice relativo [recto, derecha, izquierda]"""
-        if not self.last_action:
-            # Primera acción, cualquier dirección es válida
-            return 0  # Por defecto "recto"
-        
-        # Mapeo direccional
-        directions = ["UP", "RIGHT", "DOWN", "LEFT"]
-        current_idx = directions.index(self.last_action) if self.last_action in directions else 0
-        action_idx = directions.index(action) if action in directions else 0
-        
-        # Calcular diferencia relativa
-        diff = (action_idx - current_idx) % 4
-        
-        # Convertir a [recto, derecha, izquierda]
-        if diff == 0:  # Misma dirección = recto
-            return 0
-        elif diff == 1:  # 90° derecha
-            return 1
-        else:  # diff == 3 (270° derecha = 90° izquierda) o diff == 2 (180° vuelta)
-            return 2  # Tomamos izquierda para vuelta de 180° también
-    
-    def get_absolute_action(self, relative_action):
-        """Convierte acción relativa [recto, derecha, izquierda] a absoluta"""
-        if not self.last_action:
-            # Primera acción o sin historial, usar DOWN como default
-            self.last_action = "DOWN"
-        
-        # Mapeo direccional
-        directions = ["UP", "RIGHT", "DOWN", "LEFT"]
-        current_idx = directions.index(self.last_action)
-        
-        # Calcular nueva dirección basada en acción relativa
-        if relative_action == 0:  # Recto
-            new_idx = current_idx
-        elif relative_action == 1:  # Derecha
-            new_idx = (current_idx + 1) % 4
-        else:  # Izquierda
-            new_idx = (current_idx - 1) % 4
-        
-        return directions[new_idx]
-    
+        self.memory.append((state, action, reward, next_state, done))
+
     def train_long_memory(self):
-        """Entrena con experiencias almacenadas en memoria"""
-        if len(self.memory) < BATCH_SIZE:
-            mini_batch = self.memory
+        if len(self.memory) > BATCH_SIZE:
+            mini_sample = random.sample(self.memory, BATCH_SIZE)
         else:
-            mini_batch = random.sample(self.memory, BATCH_SIZE)
-        
-        states, actions, rewards, next_states, dones = zip(*mini_batch)
-        self.train_step(states, actions, rewards, next_states, dones)
-    
-    def train_step(self, state, action, reward, next_state, done):
-        """Implementa un paso de entrenamiento Q-learning"""
-        # Convertir a tensores
-        state = torch.tensor(np.array(state), dtype=torch.float)
-        next_state = torch.tensor(np.array(next_state), dtype=torch.float)
-        action = torch.tensor(np.array(action), dtype=torch.long)
-        reward = torch.tensor(np.array(reward), dtype=torch.float)
-        
-        # Manejar dimensiones para lotes o ejemplos individuales
-        if len(state.shape) == 1:
-            state = torch.unsqueeze(state, 0)
-            next_state = torch.unsqueeze(next_state, 0)
-            action = torch.unsqueeze(action, 0)
-            reward = torch.unsqueeze(reward, 0)
-            done = (done,)
-        
-        # Predicción de valores Q actuales
-        pred = self.model(state)
-        
-        # Crear target clonando la predicción
-        target = pred.clone()
-        
-        # Actualizar target usando ecuación de Bellman
-        for idx in range(len(done)):
-            Q_new = reward[idx]
-            if not done[idx]:
-                Q_new = reward[idx] + self.gamma * torch.max(self.model(next_state[idx]))
-            
-            target[idx][torch.argmax(action[idx])] = Q_new
-        
-        # Optimización
-        self.optimizer.zero_grad()
-        loss = self.criterion(target, pred)
-        loss.backward()
-        self.optimizer.step()
-    
+            mini_sample = self.memory
+
+        states, actions, rewards, next_states, dones = zip(*mini_sample)
+        self.trainer.train_step(states, actions, rewards, next_states, dones)
+
     def train_short_memory(self, state, action, reward, next_state, done):
-        """Entrena con una sola transición"""
-        self.train_step(state, action, reward, next_state, done)
-    
-    def choose_action(self, state, training=True):
-        """Selecciona acción usando política epsilon-greedy"""
-        # Actualizar epsilon basado en juegos jugados
-        self.epsilon = max(self.min_epsilon, 80 - self.n_games)
+        self.trainer.train_step(state, action, reward, next_state, done)
+
+    def get_action(self, state):
+        # Aumentamos la exploración al inicio
+        self.epsilon = 100 - self.n_games if self.n_games < 80 else 20
         
-        # Exploración vs explotación
-        final_move_idx = 0  # Por defecto, seguir recto
+        final_move = [0, 0, 0]
         
-        if training and random.randint(0, 200) < self.epsilon:
-            # Exploración: acción aleatoria relativa
-            final_move_idx = random.randint(0, 2)  # [recto, derecha, izquierda]
+        # Exploración aleatoria
+        if random.randint(0, 200) < self.epsilon:
+            move = random.randint(0, 2)
+            final_move[move] = 1
         else:
-            # Explotación: usar modelo
-            # Primero convertir el estado a formato numérico
-            state_array = self.get_state(state)
-            state_tensor = torch.tensor(state_array, dtype=torch.float).unsqueeze(0)
-            prediction = self.model(state_tensor)
-            final_move_idx = torch.argmax(prediction).item()
+            state0 = torch.tensor(state, dtype=torch.float)
+            prediction = self.model(state0)
+            move = torch.argmax(prediction).item()
+            final_move[move] = 1
+
+        return final_move
+
+    def calculate_dynamic_reward(self, game, done, score):
+        """Calcula recompensas dinámicas para fomentar exploración"""
+        reward = 0
+        head = game.snake[0]
         
-        # Convertir índice relativo a acción absoluta
-        action = self.get_absolute_action(final_move_idx)
-        
-        # Actualizar última acción
-        self.last_action = action
-        
-        return action
-    
-    def update_snake_length(self, new_length):
-        """Actualiza longitud de la serpiente"""
-        self.snake_length = new_length
-        if new_length > self.max_snake_length:
-            self.max_snake_length = new_length
-    
-    def save_model(self, filepath):
-        """Guarda el modelo en disco"""
-        if not filepath.endswith(".pth"):
-            filepath += ".pth"
-        
-        try:
-            self.model.save(filepath)
+        # Penalización por muerte
+        if done:
+            return -10
             
-            # Guardar metadatos
-            metadata_path = filepath.replace(".pth", ".meta")
-            with open(metadata_path, "w") as f:
-                import json
-                json.dump({
-                    "n_games": self.n_games,
-                    "epsilon": self.epsilon,
-                    "max_snake_length": self.max_snake_length
-                }, f)
+        # Recompensa por comer
+        if score > self.last_score:
+            self.last_score = score
+            reward += 10
+            # Resetear el contador de movimientos sin progreso
+            self.moves_without_progress = 0
+            return reward
             
-            if self.verbose:
-                print(f"Modelo guardado en {filepath}")
-        except Exception as e:
-            print(f"Error al guardar: {e}")
-    
-    def load_model(self, filepath):
-        """Carga modelo desde disco"""
-        if not filepath.endswith(".pth"):
-            filepath += ".pth"
+        # Calcular distancia actual a la comida
+        current_distance = self._calculate_distance(head, game.food)
         
-        try:
-            state_dict = torch.load(filepath)
-            self.model.load_state_dict(state_dict)
+        # Recompensa por acercarse a la comida (si es visible)
+        if self.food_seen and current_distance < self.previous_distance:
+            reward += 0.5
+            self.moves_without_progress = 0
+        else:
+            # Penalización por no acercarse
+            self.moves_without_progress += 1
             
-            # Cargar metadatos
-            metadata_path = filepath.replace(".pth", ".meta")
-            if os.path.exists(metadata_path):
-                with open(metadata_path, "r") as f:
-                    import json
-                    data = json.load(f)
-                    self.n_games = data.get("n_games", 0)
-                    self.epsilon = data.get("epsilon", 80 - self.n_games)
-                    self.max_snake_length = data.get("max_snake_length", 3)
+        # Penalización por estar dando vueltas sin progreso
+        if self.moves_without_progress > 50:
+            reward -= 0.2
+        
+        # Recompensa por explorar nuevas celdas
+        if (head.x, head.y) not in self.visited_cells or len(self.visited_cells) < 10:
+            reward += 0.1
             
-            if self.verbose:
-                print(f"Modelo cargado desde {filepath}")
-        except Exception as e:
-            print(f"Error al cargar modelo: {e}")
+        # Actualizar distancia previa
+        self.previous_distance = current_distance
+            
+        return reward
+
+
+def train():
+    plot_scores = []
+    plot_mean_scores = []
+    total_score = 0
+    record = 0
+    agent = Agent()
+    game = SnakeGameAI()
     
-    def learn(self, state, action, reward, next_state):
-        """Interfaz unificada para aprendizaje"""
-        done = reward <= -10  # Penalización grande indica fin
-        
-        # Procesar estados
-        state_array = self.get_state(state)
-        next_state_array = self.get_state(next_state)
-        
-        # Convertir acción a formato one-hot
-        action_idx = self.get_relative_action_idx(action)
-        action_one_hot = [0] * self.action_size
-        action_one_hot[action_idx] = 1
-        
-        # Entrenamiento de memoria corta
-        self.train_short_memory(state_array, action_one_hot, reward, next_state_array, done)
-        
-        # Guardar experiencia
-        self.remember(state_array, action, reward, next_state_array, done)
+    # Inicializar estado del agente
+    agent.reset(game)
     
-    def decay_exploration(self):
-        """Actualiza contadores y exploración"""
-        self.n_games += 1
-        # No necesitamos decaimiento manual ya que epsilon se calcula en cada acción
-    
-    def reset_session(self):
-        """Reinicia para nueva sesión"""
-        self.snake_length = 3
-        self.last_action = None
+    while True:
+        # Obtener estado actual
+        state_old = agent.get_state(game)
+
+        # Obtener acción
+        final_move = agent.get_action(state_old)
+
+        # Realizar movimiento y obtener nuevo estado
+        default_reward, done, score = game.play_step(final_move)
+        
+        # Calcular recompensa dinámica
+        dynamic_reward = agent.calculate_dynamic_reward(game, done, score)
+        
+        state_new = agent.get_state(game)
+
+        # Entrenar memoria a corto plazo
+        agent.train_short_memory(state_old, final_move, dynamic_reward, state_new, done)
+
+        # Recordar para entrenar memoria a largo plazo
+        agent.remember(state_old, final_move, dynamic_reward, state_new, done)
+
+        if done:
+            # Reiniciar juego
+            game.reset()
+            agent.n_games += 1
+            
+            # Entrenar memoria a largo plazo
+            agent.train_long_memory()
+            
+            # Reiniciar estado del agente
+            agent.reset(game)
+
+            if score > record:
+                record = score
+                agent.model.save()
+
+            print('Game', agent.n_games, 'Score', score, 'Record:', record)
+
+            plot_scores.append(score)
+            total_score += score
+            mean_score = total_score / agent.n_games
+            plot_mean_scores.append(mean_score)
+            plot(plot_scores, plot_mean_scores)
+
+
+if __name__ == '__main__':
+    train()
