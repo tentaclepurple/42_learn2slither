@@ -209,7 +209,7 @@ class SnakeAILauncher:
             cmd.extend(["-speed", str(int(self.speed_var.get()))])
         else:
             # Lanzar en modo IA (entrenamiento o juego)
-            cmd = ["python3", "learn2slitherv3.py"]
+            cmd = ["python3", "learn2slither.py"]
             
             # Añadir argumentos
             cmd.extend(["-size", str(self.size_var.get())])

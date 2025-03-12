@@ -9,16 +9,20 @@ from enum import Enum
 from collections import namedtuple
 import matplotlib.pyplot as plt
 from IPython import display
+from utils import get_snake_vision_display
+
 
 # Definiciones básicas
 pygame.init()
 font = pygame.font.Font('arial.ttf', 20)
+
 
 class Direction(Enum):
     RIGHT = 1
     LEFT = 2
     UP = 3
     DOWN = 4
+
 
 Point = namedtuple('Point', 'x, y')
 
@@ -530,6 +534,7 @@ def plot(scores, mean_scores):
     plt.show(block=False)
     plt.pause(.1)
 
+
 def train():
     # Parsear argumentos
     parser = argparse.ArgumentParser(description='Train Snake AI')
@@ -541,6 +546,8 @@ def train():
     parser.add_argument('-dontlearn', action='store_true', help='Disable learning')
     parser.add_argument('-step', action='store_true', help='Step by step mode')
     parser.add_argument('-size', type=int, default=20, help='Size of the board (number of cells)')
+    parser.add_argument('-state', choices=['on', 'off'], default='off', 
+                   help='Show snake vision state in terminal')
     args = parser.parse_args()
     
     # Inicializar
@@ -595,6 +602,11 @@ def train():
             # Entrenar memoria corta
             agent.train_short_memory(state_old, final_move, reward, state_new, done)
             agent.remember(state_old, final_move, reward, state_new, done)
+
+            if args.state == 'on':
+                print("\033[H\033[J", end="")  # Limpiar pantalla
+                print(get_snake_vision_display(game, BLOCK_SIZE))
+                print(f"Score: {game.score} | Games: {agent.n_games} | Record: {record}")
 
             # Control de velocidad
             if args.speed > 0 and is_visual:
