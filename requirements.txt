@@ -1,4 +1,6 @@
 numpy==1.24.3
 pygame==2.5.0
 # La siguiente línea no es necesaria en WSL
-# windows-curses==2.3.1; sys_platform == 'win32'
+# windows-curses==2.3.1; sys_platform == 'win32'torch==2.5.1
+flake8==7.1.0
+pyflakes==3.2.0
