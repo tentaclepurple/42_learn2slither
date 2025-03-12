@@ -3,6 +3,8 @@ import random
 from enum import Enum
 from collections import namedtuple
 import numpy as np
+import os
+os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = '1'  # Oculta el mensaje de bienvenida de pygame
 
 pygame.init()
 font = pygame.font.Font('arial.ttf', 25)
